@@ -4,6 +4,15 @@
 #include "AdvertDataHelpers.h"
 #include <RTClib.h>
 
+// Pull in global FOTA protocol definitions and background task managers
+#include "FotaProtocol.h"
+#include "FotaSender.h"
+#include "FotaReceiver.h"
+
+// Reference global class instances instantiated elsewhere in your firmware
+extern FotaSender fotaSender;
+extern FotaReceiver fotaReceiver;
+
 #ifndef BRIDGE_MAX_BAUD
 #define BRIDGE_MAX_BAUD 115200
 #endif
@@ -88,7 +97,6 @@ void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {
     file.read((uint8_t *)&_prefs->adc_multiplier, sizeof(_prefs->adc_multiplier));                 // 166
     file.read((uint8_t *)_prefs->owner_info, sizeof(_prefs->owner_info));                          // 170
     file.read((uint8_t *)&_prefs->rx_boosted_gain, sizeof(_prefs->rx_boosted_gain));              // 290
-    // next: 291
 
     // sanitise bad pref values
     _prefs->rx_delay_base = constrain(_prefs->rx_delay_base, 0, 20.0f);
@@ -102,7 +110,7 @@ void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {
     _prefs->tx_power_dbm = constrain(_prefs->tx_power_dbm, -9, 30);
     _prefs->multi_acks = constrain(_prefs->multi_acks, 0, 1);
     _prefs->adc_multiplier = constrain(_prefs->adc_multiplier, 0.0f, 10.0f);
-    _prefs->path_hash_mode = constrain(_prefs->path_hash_mode, 0, 2);   // NOTE: mode 3 reserved for future
+    _prefs->path_hash_mode = constrain(_prefs->path_hash_mode, 0, 2);
 
     // sanitise bad bridge pref values
     _prefs->bridge_enabled = constrain(_prefs->bridge_enabled, 0, 1);
@@ -179,7 +187,6 @@ void CommonCLI::savePrefs(FILESYSTEM* fs) {
     file.write((uint8_t *)&_prefs->adc_multiplier, sizeof(_prefs->adc_multiplier));                 // 166
     file.write((uint8_t *)_prefs->owner_info, sizeof(_prefs->owner_info));                          // 170
     file.write((uint8_t *)&_prefs->rx_boosted_gain, sizeof(_prefs->rx_boosted_gain));              // 290
-    // next: 291
 
     file.close();
   }
@@ -189,7 +196,7 @@ void CommonCLI::savePrefs(FILESYSTEM* fs) {
 
 void CommonCLI::savePrefs() {
   if (_prefs->advert_interval * 2 < MIN_LOCAL_ADVERT_INTERVAL) {
-    _prefs->advert_interval = 0;  // turn it off, now that device has been manually configured
+    _prefs->advert_interval = 0;
   }
   _callbacks->savePrefs();
 }
@@ -208,21 +215,86 @@ uint8_t CommonCLI::buildAdvertData(uint8_t node_type, uint8_t* app_data) {
 }
 
 void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* reply) {
-    if (memcmp(command, "poweroff", 8) == 0 || memcmp(command, "shutdown", 8) == 0) {
-      _board->powerOff();  // doesn't return
+    // Remove any trailing carriage returns or newlines safely from serial inputs
+    int cmd_len = strlen(command);
+    while (cmd_len > 0 && (command[cmd_len - 1] == '\r' || command[cmd_len - 1] == '\n')) {
+        command[cmd_len - 1] = 0;
+        cmd_len--;
+    }
+
+    // -------------------------------------------------------------------------
+    // CUSTOM INTERCEPTION ROUTINE: DYNAMIC FOTA PROCESSOR
+    // -------------------------------------------------------------------------
+    if (memcmp(command, "fota_push ", 10) == 0) {
+        char filename_param[32] = {0};
+        char target_str[16] = {0};
+        uint32_t fileSize = 0;
+        char crc_str[16] = {0};
+        char verbose_flag[16] = {0};
+
+        // Parse 5 tokens: fota_push <filename> <target_hex_id> <size> <hex_crc> [-v]
+        int parsed = sscanf(command + 10, "%31s %15s %u %15s %15s", 
+                            filename_param, target_str, &fileSize, crc_str, verbose_flag);
+
+        if (parsed < 4) {
+            strcpy(reply, "ERR: Syntax must be fota_push <filename> <target_hex_id> <size> <hex_crc> [-v]");
+        } else {
+            // Safely handle 64-bit target node IDs to prevent 32-bit register truncations
+            uint64_t destNodeId = strtoull(target_str, NULL, 16);
+            uint32_t fileCrc = strtoul(crc_str, NULL, 16);
+            
+            // Check if optional metrics logging parameter was provided
+            bool isVerbose = (parsed == 5 && (strcmp(verbose_flag, "verbose") == 0 || strcmp(verbose_flag, "-v") == 0));
+
+            if (destNodeId == 0 || fileSize == 0) {
+                strcpy(reply, "ERR: Invalid targets or file size specifications.");
+            } else {
+                fotaSender.startTransfer(destNodeId, filename_param, fileSize, fileCrc, isVerbose);
+                sprintf(reply, "ACK: Commencing FOTA push sequence");
+            }
+        }
+        return; // Intercepted; exit immediately to bypass default mesh processors
+    } else if (strcasecmp(command, "fota_ls") == 0) {
+        char file_list[256] = "Files found: ";
+        
+        // Open the root directory of the internal filesystem
+        File root = InternalFS.open("/");
+        if (!root || !root.isDirectory()) {
+            strcpy(reply, "ERR: InternalFS root directory could not be opened.");
+            return;
+        }
+
+        File file = root.openNextFile();
+        if (!file) {
+            strcpy(reply, "InternalFS is completely empty.");
+        } else {
+            while (file) {
+                strcat(file_list, "[");
+                strcat(file_list, file.name()); // This prints exactly how the FS formatted it
+                strcat(file_list, "] ");
+                file.close();
+                file = root.openNextFile();
+            }
+            strncpy(reply, file_list, 159); // Safely copy to reply buffer limit
+        }
+        root.close();
+        return;
+    } else if (strcasecmp(command, "fota_abort") == 0) {
+        fotaSender.stopTransfer();
+        strcpy(reply, "ACK: FOTA background transfer processes stopped cleanly.");
+        return; // Intercepted; exit immediately
+    } else if (memcmp(command, "poweroff", 8) == 0 || memcmp(command, "shutdown", 8) == 0) {
+      _board->powerOff();
     } else if (memcmp(command, "reboot", 6) == 0) {
-      _board->reboot();  // doesn't return
+      _board->reboot();
     } else if (memcmp(command, "clkreboot", 9) == 0) {
-      // Reset clock
-      getRTCClock()->setCurrentTime(1715770351);  // 15 May 2024, 8:50pm
-      _board->reboot();  // doesn't return
+      getRTCClock()->setCurrentTime(1715770351);
+      _board->reboot();
      } else if (memcmp(command, "advert.zerohop", 14) == 0 && (command[14] == 0 || command[14] == ' ')) {
-      // send zerohop advert
-      _callbacks->sendSelfAdvertisement(1500, false);  // longer delay, give CLI response time to be sent first
+      _callbacks->sendSelfAdvertisement(1500, false);
       strcpy(reply, "OK - zerohop advert sent");
     } else if (memcmp(command, "advert", 6) == 0) {
-      // send flood advert
-      _callbacks->sendSelfAdvertisement(1500, true);  // longer delay, give CLI response time to be sent first
+      _callbacks->sendSelfAdvertisement(1500, true);
       strcpy(reply, "OK - Advert sent");
     } else if (memcmp(command, "clock sync", 10) == 0) {
       uint32_t curr = getRTCClock()->getCurrentTime();
@@ -242,7 +314,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       uint32_t now = getRTCClock()->getCurrentTime();
       DateTime dt = DateTime(now);
       sprintf(reply, "%02d:%02d - %d/%d/%d UTC", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
-    } else if (memcmp(command, "time ", 5) == 0) {  // set time (to epoch seconds)
+    } else if (memcmp(command, "time ", 5) == 0) {
       uint32_t secs = _atoi(&command[5]);
       uint32_t curr = getRTCClock()->getCurrentTime();
       if (secs > curr) {
@@ -282,10 +354,9 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         strcpy(reply, "Error, invalid params");
       }
     } else if (memcmp(command, "password ", 9) == 0) {
-      // change admin password
       StrHelper::strncpy(_prefs->password, &command[9], sizeof(_prefs->password));
       savePrefs();
-      sprintf(reply, "password now: %s", _prefs->password);   // echo back just to let admin know for sure!!
+      sprintf(reply, "password now: %s", _prefs->password);
     } else if (memcmp(command, "clear stats", 11) == 0) {
       _callbacks->clearStats();
       strcpy(reply, "(OK - stats reset)");
@@ -341,7 +412,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         if (i < end) {
           sprintf(dp, "... next:%d", i);
         } else {
-          *(dp-1) = 0; // remove last CR
+          *(dp-1) = 0;
         }
       }
     } else if (memcmp(command, "region", 6) == 0) {
@@ -409,8 +480,8 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     } else if (memcmp(command, "gps", 3) == 0) {
       LocationProvider * l = _sensors->getLocationProvider();
       if (l != NULL) {
-        bool enabled = l->isEnabled(); // is EN pin on ?
-        bool fix = l->isValid();       // has fix ?
+        bool enabled = l->isEnabled();
+        bool fix = l->isValid();
         int sats = l->satellitesCount();
         bool active = !strcmp(_sensors->getSettingByKey("gps"), "1");
         if (enabled) {
@@ -428,7 +499,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     } else if (memcmp(command, "powersaving on", 14) == 0) {
       _prefs->powersaving_enabled = 1;
       savePrefs();
-      strcpy(reply, "ok"); // TODO: to return Not supported if required
+      strcpy(reply, "ok");
     } else if (memcmp(command, "powersaving off", 15) == 0) {
       _prefs->powersaving_enabled = 0;
       savePrefs();
@@ -523,7 +594,6 @@ void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* rep
   } else if (memcmp(config, "prv.key ", 8) == 0) {
     uint8_t prv_key[PRV_KEY_SIZE];
     bool success = mesh::Utils::fromHex(prv_key, PRV_KEY_SIZE, &config[8]);
-    // only allow rekey if key is valid
     if (success && mesh::LocalIdentity::validatePrivateKey(prv_key)) {
       mesh::LocalIdentity new_id;
       new_id.readFrom(prv_key, PRV_KEY_SIZE);
@@ -618,7 +688,7 @@ void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* rep
     config += 11;
     char *dp = _prefs->owner_info;
     while (*config && dp - _prefs->owner_info < sizeof(_prefs->owner_info)-1) {
-      *dp++ = (*config == '|') ? '\n' : *config;    // translate '|' to newline chars
+      *dp++ = (*config == '|') ? '\n' : *config;
       config++;
     }
     *dp = 0;
@@ -753,7 +823,7 @@ void CommonCLI::handleGetCmd(uint32_t sender_timestamp, char* command, char* rep
     sprintf(reply, "> %d", ((uint32_t) _prefs->advert_interval) * 2);
   } else if (memcmp(config, "guest.password", 14) == 0) {
     sprintf(reply, "> %s", _prefs->guest_password);
-  } else if (sender_timestamp == 0 && memcmp(config, "prv.key", 7) == 0) {  // from serial command line only
+  } else if (sender_timestamp == 0 && memcmp(config, "prv.key", 7) == 0) {
     uint8_t prv_key[PRV_KEY_SIZE];
     int len = _callbacks->getSelfId().writeTo(prv_key, PRV_KEY_SIZE);
     mesh::Utils::toHex(tmp, prv_key, len);
@@ -788,10 +858,10 @@ void CommonCLI::handleGetCmd(uint32_t sender_timestamp, char* command, char* rep
     *reply++ = ' ';
     const char* sp = _prefs->owner_info;
     while (*sp) {
-      *reply++ = (*sp == '\n') ? '|' : *sp;    // translate newline back to orig '|'
+      *reply++ = (*sp == '\n') ? '|' : *sp;
       sp++;
     }
-    *reply = 0;  // set null terminator
+    *reply = 0;
   } else if (memcmp(config, "path.hash.mode", 14) == 0) {
     sprintf(reply, "> %d", (uint32_t)_prefs->path_hash_mode);
   } else if (memcmp(config, "loop.detect", 11) == 0) {
@@ -859,7 +929,6 @@ void CommonCLI::handleGetCmd(uint32_t sender_timestamp, char* command, char* rep
     } else {
       sprintf(reply, "> %.3f", adc_mult);
     }
-  // Power management commands
   } else if (memcmp(config, "pwrmgt.support", 14) == 0) {
 #ifdef NRF52_POWER_MANAGEMENT
     strcpy(reply, "> supported");
@@ -901,7 +970,7 @@ void CommonCLI::handleRegionCmd(char* command, char* reply) {
   } else if (n >= 2 && strcmp(parts[1], "load") == 0) {
     _callbacks->startRegionsLoad();
   } else if (n >= 2 && strcmp(parts[1], "save") == 0) {
-    _prefs->discovery_mod_timestamp = getRTCClock()->getCurrentTime();   // this node is now 'modified' (for discovery info)
+    _prefs->discovery_mod_timestamp = getRTCClock()->getCurrentTime();
     savePrefs();
     bool success = _callbacks->saveRegions();
     strcpy(reply, success ? "OK" : "Err - save failed");
@@ -948,18 +1017,18 @@ void CommonCLI::handleRegionCmd(char* command, char* reply) {
     if (strcmp(parts[2], "<null>") == 0) {
       _region_map->setDefaultRegion(NULL);
       _callbacks->onDefaultRegionChanged(NULL);
-      _callbacks->saveRegions();  // persist in one atomic step
+      _callbacks->saveRegions();
       sprintf(reply, " default scope is now <null>");
     } else {
       auto def = _region_map->findByNamePrefix(parts[2]);
       if (def == NULL) {
-        def = _region_map->putRegion(parts[2], 0);  // auto-create the default region
+        def = _region_map->putRegion(parts[2], 0);
       }
       if (def) {
-        def->flags = 0;   // make sure allow flood enabled
+        def->flags = 0;
         _region_map->setDefaultRegion(def);
         _callbacks->onDefaultRegionChanged(def);
-        _callbacks->saveRegions();  // persist in one atomic step
+        _callbacks->saveRegions();
         sprintf(reply, " default scope is now %s", def->name);
       } else {
         strcpy(reply, "Err - region table full");
@@ -977,7 +1046,7 @@ void CommonCLI::handleRegionCmd(char* command, char* reply) {
       if (region == NULL) {
         strcpy(reply, "Err - unable to put");
       } else {
-        region->flags = 0;   // New default: enable flood
+        region->flags = 0;
         strcpy(reply, "OK - (flood allowed)");
       }
     }
@@ -998,10 +1067,10 @@ void CommonCLI::handleRegionCmd(char* command, char* reply) {
     
     if (strcmp(parts[2], "allowed") == 0) {
       mask = REGION_DENY_FLOOD;
-      invert = false;  // list regions that DON'T have DENY flag
+      invert = false;
     } else if (strcmp(parts[2], "denied") == 0) {
       mask = REGION_DENY_FLOOD;
-      invert = true;   // list regions that DO have DENY flag
+      invert = true;
     } else {
       strcpy(reply, "Err - use 'allowed' or 'denied'");
       return;
@@ -1015,3 +1084,5 @@ void CommonCLI::handleRegionCmd(char* command, char* reply) {
     strcpy(reply, "Err - ??");
   }
 }
+
+// namespace CommonCLI
