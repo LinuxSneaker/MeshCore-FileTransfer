@@ -3,6 +3,10 @@
 
 #include "MyMesh.h"
 
+// INCLUDE YOUR FOTA STATE MANAGERS HERE
+#include "FotaReceiver.h"
+#include "FotaSender.h"
+
 #ifdef DISPLAY_CLASS
   #include "UITask.h"
   static UITask ui_task(display);
@@ -12,6 +16,10 @@ StdRNG fast_rng;
 SimpleMeshTables tables;
 
 MyMesh the_mesh(board, radio_driver, *new ArduinoMillis(), fast_rng, rtc_clock, tables);
+
+// INSTANTIATE THE FOTA MODULES GLOBALLY
+FotaReceiver fotaReceiver;
+FotaSender fotaSender;
 
 void halt() {
   while (1) ;
@@ -124,7 +132,50 @@ void loop() {
     Serial.print('\n');
     command[len - 1] = 0;  // replace newline with C string null terminator
     char reply[160];
-    the_mesh.handleCommand(0, command, reply);  // NOTE: there is no sender_timestamp via serial!
+    reply[0] = 0;
+
+   // Inside main.cpp text command parser block:
+   // Replace the fota_push block inside your main.cpp loop with this:
+
+  if (memcmp(command, "fota_push ", 10) == 0) {
+    char filename_param[32] = {0};
+    char target_str[16] = {0};
+    uint32_t fileSize = 0;
+    char crc_str[16] = {0};
+    char verbose_flag[16] = {0};
+
+    // Parse 5 tokens: fota_push <file> <target> <size> <crc> [verbose]
+    int parsed = sscanf(command + 10, "%31s %15s %u %15s %15s", 
+                        filename_param, target_str, &fileSize, crc_str, verbose_flag);
+
+    if (parsed < 4) {
+        strcpy(reply, "ERR: Syntax must be fota_push <filename> <target_hex_id> <size> <hex_crc> [-v]");
+    } else {
+        uint64_t destNodeId = strtoull(target_str, NULL, 16);
+        uint32_t fileCrc = strtoul(crc_str, NULL, 16);
+        
+        // Check if the 5th argument is the verbose flag
+        bool isVerbose = (parsed == 5 && (strcmp(verbose_flag, "verbose") == 0 || strcmp(verbose_flag, "-v") == 0));
+
+        if (destNodeId == 0 || fileSize == 0) {
+            strcpy(reply, "ERR: Invalid targets or file size specifications.");
+        } else {
+            // Pass the custom filename parsed straight from your CLI input
+            fotaSender.startTransfer(destNodeId, filename_param, fileSize, fileCrc, isVerbose);
+            sprintf(reply, "ACK: Commencing FOTA push sequence");
+        }
+    }
+  } 
+    
+    else if (strcasecmp(command, "fota_abort") == 0) {
+      fotaSender.stopTransfer();
+      strcpy(reply, "ACK: FOTA process aborted cleanly.");
+    }
+    else {
+      // If it isn't a custom FOTA action macro, route it to standard mesh processing engine
+      the_mesh.handleCommand(0, command, reply);
+    }
+
     if (reply[0]) {
       Serial.print("  -> "); Serial.println(reply);
     }
@@ -147,12 +198,17 @@ void loop() {
   }
 #endif
 
+  // RUN NATIVE CORE ASSETS
   the_mesh.loop();
   sensors.loop();
 #ifdef DISPLAY_CLASS
   ui_task.loop();
 #endif
   rtc_clock.tick();
+
+  // TICK BACKGROUND FOTA STATE EXECUTORS EVERY HARDWARE CYCLE
+  fotaReceiver.updateTimeout();
+  fotaSender.serviceLoop();
 
   if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
     #if defined(NRF52_PLATFORM)
