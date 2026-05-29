@@ -2,6 +2,8 @@
 
 This is an experimental fork of MeshCore. It may be a stupid idea that is unworkable, but that will be seen from trying it. MeshCore-FileTransfer is attempting to add code that will allow transfering files, specifically Firmware updates, from one repeater to another. The intent is that this would be over a zero hop route, and would be to those repeaters that truly are in a location that is difficult to access. If the idea works, it would be great if a companion radio would be able to upload to a repeater.
 
+I want to be very clear on this. I have been several years from doing any programming, and the additional code in MeshCore-FileTransfeer are from using an AI tool. This code is not intended to be deployed in any sort of operational capacity, and only serves to show that this is (or is not) possible.
+
 ## 🔍 What is MeshCore?
 
 MeshCore now supports a range of LoRa devices, allowing for easy flashing without the need to compile firmware manually. Users can flash a pre-built binary using tools like Adafruit ESPTool and interact with the network through a serial console.
